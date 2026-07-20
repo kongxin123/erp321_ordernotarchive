@@ -1,74 +1,46 @@
 // ==UserScript==
 // @name         聚水潭订单列表 当前+归档 合并
 // @namespace    jstyh.erp321.order.merge
-// @version      1.2.0
-// @description  拦截订单 LoadDataToJSON，并行请求归档列表，按 o_id 去重合并后返回页面
+// @version      1.3.0
+// @description  拦截订单 LoadDataToJSON，并行请求归档，按 o_id 去重合并 datas 后返回
 // @author       jstyh
 // @match        https://www.erp321.com/*
 // @match        https://*.erp321.com/*
 // @run-at       document-start
 // @grant        none
+// @license      MIT
 // ==/UserScript==
 
 /**
- * 真实流量差异（其余 header/body 相同）：
+ * 请求差异（body 完全相同，仅 URL/Referer）：
+ *   当前: .../list.aspx?_c=jst-epaas&epaas=true&ts___=...&am___=LoadDataToJSON
+ *   归档: .../list.aspx?archive=true&no_data=true&_c=jst-epaas&epaas=true&ts___=...&am___=LoadDataToJSON
  *
- * 当前:
- *   /app/order/order/list.aspx?_c=jst-epaas&epaas=true&ts___=...&am___=LoadDataToJSON
- *   Referer: .../list.aspx?_c=jst-epaas&epaas=true
- *
- * 归档:
- *   /app/order/order/list.aspx?archive=true&no_data=true&_c=jst-epaas&epaas=true&ts___=...&am___=LoadDataToJSON
- *   Referer: .../list.aspx?archive=true&no_data=true&_c=jst-epaas&epaas=true
- *
- * Body: application/x-www-form-urlencoded
- *   __VIEWSTATE / __CALLBACKID=JTable1 / __CALLBACKPARAM={Method:LoadDataToJSON,...}
- *   分页增量键: _jt_page_increament_key_name=o_id
+ * 响应结构（已实测）：
+ *   0|{"IsSuccess":true,"ReturnValue":"{\"dp\":{...},\"datas\":[...]}",...}
+ *                    └─ ReturnValue 是 JSON 字符串，内含 dp + datas
+ *   去重键: datas[].o_id（与 dp.Increament.KeyName 一致）
  */
 (function () {
   'use strict';
 
   const CFG = {
     pathIncludes: '/app/order/order/list.aspx',
-    // 去重：页面增量键就是 o_id
-    idKeys: ['o_id', 'so_id', 'order_id', 'id'],
-    // JTable 常见数据路径
-    listPaths: [
-      ['datas'],
-      ['data'],
-      ['dp', 'data'],
-      ['dp', 'datas'],
-      ['ReturnValue', 'datas'],
-      ['ReturnValue', 'data'],
-      ['ReturnValue', 'dp', 'data'],
-      ['d', 'datas'],
-      ['d', 'data'],
-    ],
-    countPaths: [
-      ['dataCount'],
-      ['datacount'],
-      ['dp', 'dataCount'],
-      ['dp', 'datacount'],
-      ['ReturnValue', 'dataCount'],
-      ['ReturnValue', 'dp', 'dataCount'],
-    ],
     log: true,
   };
 
   const log = (...a) => CFG.log && console.log('[订单合并]', ...a);
 
-  // ---------- URL ----------
+  // ==================== URL ====================
   function absUrl(url) {
     return new URL(url, location.origin);
   }
 
-  /** 当前列表（非归档）的 LoadDataToJSON */
   function isCurrentLoadDataUrl(url) {
     try {
       const u = absUrl(url);
       if (!u.pathname.includes(CFG.pathIncludes)) return false;
       if (u.searchParams.get('archive') === 'true') return false;
-      // URL 带 am___=LoadDataToJSON，或后续靠 body 再确认
       const am = u.searchParams.get('am___');
       if (am && am !== 'LoadDataToJSON') return false;
       return true;
@@ -77,7 +49,6 @@
     }
   }
 
-  /** body 里必须是 JTable LoadDataToJSON，避免误拦同页其它回调 */
   function isLoadDataBody(body) {
     if (body == null) return false;
     const s = typeof body === 'string' ? body : String(body);
@@ -90,7 +61,6 @@
 
   function toArchiveUrl(url) {
     const u = absUrl(url);
-    // 与抓包一致：archive / no_data 放在最前也可，顺序不影响
     u.searchParams.set('archive', 'true');
     u.searchParams.set('no_data', 'true');
     if (u.searchParams.has('ts___')) {
@@ -103,42 +73,12 @@
     const u = absUrl(url);
     u.searchParams.set('archive', 'true');
     u.searchParams.set('no_data', 'true');
-    // referer 不带 ts___ / am___
     u.searchParams.delete('ts___');
     u.searchParams.delete('am___');
     return u.toString();
   }
 
-  // ---------- 解析 ASP.NET 回调 / JSON ----------
-  /**
-   * 拆回调外壳，保留前缀以便写回页面。
-   * 常见：纯 JSON  或  0|{...}  或  0|#|...（失败时）
-   */
-  function unwrapPayload(raw) {
-    const text = String(raw == null ? '' : raw).replace(/^\uFEFF/, '');
-    if (!text) return { prefix: '', jsonText: '', obj: null };
-
-    // 纯 JSON
-    if (text[0] === '{' || text[0] === '[') {
-      const obj = safeJson(text);
-      return { prefix: '', jsonText: text, obj };
-    }
-
-    // n|{json}
-    const pipe = text.indexOf('|');
-    if (pipe > 0 && pipe < 8 && /^\d+$/.test(text.slice(0, pipe))) {
-      const prefix = text.slice(0, pipe + 1);
-      const rest = text.slice(pipe + 1);
-      if (rest[0] === '{' || rest[0] === '[') {
-        return { prefix, jsonText: rest, obj: safeJson(rest) };
-      }
-      // 非 JSON 回调结果，不合并
-      return { prefix, jsonText: rest, obj: null };
-    }
-
-    return { prefix: '', jsonText: text, obj: safeJson(text) };
-  }
-
+  // ==================== 解析 / 合并 ====================
   function safeJson(s) {
     try {
       return JSON.parse(s);
@@ -147,179 +87,140 @@
     }
   }
 
-  function getByPath(obj, path) {
-    let cur = obj;
-    for (const k of path) {
-      if (cur == null || typeof cur !== 'object') return undefined;
-      cur = cur[k];
-    }
-    return cur;
-  }
+  /**
+   * 拆 "0|{...}" 外壳
+   * @returns {{ prefix: string, envelope: object|null }}
+   */
+  function parseEnvelope(raw) {
+    const text = String(raw == null ? '' : raw).replace(/^\uFEFF/, '');
+    if (!text) return { prefix: '', envelope: null };
 
-  function setByPath(obj, path, value) {
-    let cur = obj;
-    for (let i = 0; i < path.length - 1; i++) {
-      const k = path[i];
-      if (cur[k] == null || typeof cur[k] !== 'object') cur[k] = {};
-      cur = cur[k];
-    }
-    cur[path[path.length - 1]] = value;
-  }
+    let prefix = '';
+    let jsonText = text;
 
-  /** ReturnValue 有时是 JSON 字符串，展开后再找列表 */
-  function normalizeRoot(obj) {
-    if (!obj || typeof obj !== 'object') return obj;
-    if (typeof obj.ReturnValue === 'string') {
-      const inner = safeJson(obj.ReturnValue);
-      if (inner && typeof inner === 'object') {
-        // 不破坏外层字段，挂一个解析结果供查找；写回时再序列化
-        obj = { ...obj, __rvObj: inner };
-      }
-    }
-    return obj;
-  }
-
-  function findListMeta(obj) {
-    if (!obj || typeof obj !== 'object') return null;
-    const roots = [obj];
-    if (obj.__rvObj) roots.push(obj.__rvObj);
-    if (typeof obj.ReturnValue === 'object' && obj.ReturnValue) {
-      roots.push(obj.ReturnValue);
+    // 0|{json}
+    const pipe = text.indexOf('|');
+    if (pipe > 0 && pipe < 8 && /^\d+$/.test(text.slice(0, pipe))) {
+      prefix = text.slice(0, pipe + 1);
+      jsonText = text.slice(pipe + 1);
     }
 
-    for (const root of roots) {
-      for (const path of CFG.listPaths) {
-        const val = getByPath(root, path);
-        if (Array.isArray(val)) {
-          return { root, path, list: val, isRv: root === obj.__rvObj };
-        }
-      }
-      if (Array.isArray(root)) {
-        return { root, path: null, list: root, isRv: false };
-      }
-    }
-    return null;
-  }
-
-  function findCountPath(root) {
-    if (!root || typeof root !== 'object') return null;
-    for (const path of CFG.countPaths) {
-      const val = getByPath(root, path);
-      if (
-        typeof val === 'number' ||
-        (typeof val === 'string' && val !== '' && !Number.isNaN(Number(val)))
-      ) {
-        return path;
-      }
-    }
-    return null;
-  }
-
-  function rowKey(row) {
-    if (row == null || typeof row !== 'object') return `raw:${row}`;
-    for (const k of CFG.idKeys) {
-      if (row[k] != null && row[k] !== '') return `${k}:${row[k]}`;
-    }
-    try {
-      return `json:${JSON.stringify(row)}`;
-    } catch {
-      return `rnd:${Math.random()}`;
-    }
-  }
-
-  function mergeLists(a, b) {
-    const seen = new Set();
-    const out = [];
-    let added = 0;
-    for (const row of a) {
-      const k = rowKey(row);
-      if (seen.has(k)) continue;
-      seen.add(k);
-      out.push(row);
-    }
-    for (const row of b) {
-      const k = rowKey(row);
-      if (seen.has(k)) continue;
-      seen.add(k);
-      out.push(row);
-      added++;
-    }
-    return { list: out, added };
+    const envelope = safeJson(jsonText);
+    return { prefix, envelope };
   }
 
   /**
-   * 合并两路响应文本，保留当前响应的回调前缀（如 "0|"）
+   * 从 envelope 取出表格负载 { dp, datas }
+   * ReturnValue 实测是 JSON 字符串
    */
-  function mergeResponses(currentRaw, archiveRaw) {
-    const curWrap = unwrapPayload(currentRaw);
-    const arcWrap = unwrapPayload(archiveRaw);
+  function getTablePayload(envelope) {
+    if (!envelope || typeof envelope !== 'object') return null;
 
-    if (!curWrap.obj) {
-      log('当前响应无法解析 JSON，原样返回。预览:', String(currentRaw).slice(0, 120));
-      return String(currentRaw);
+    let rv = envelope.ReturnValue;
+    if (typeof rv === 'string') {
+      rv = safeJson(rv);
     }
-    if (!arcWrap.obj) {
-      log('归档响应无法解析 JSON，仅返回当前');
-      return String(currentRaw);
+    if (!rv || typeof rv !== 'object') return null;
+    if (!Array.isArray(rv.datas)) {
+      // 兼容偶发空数据
+      if (rv.datas == null) rv.datas = [];
+      else return null;
     }
-
-    let curObj = normalizeRoot(curWrap.obj);
-    let arcObj = normalizeRoot(arcWrap.obj);
-
-    const curMeta = findListMeta(curObj);
-    const arcMeta = findListMeta(arcObj);
-
-    if (!curMeta && !arcMeta) {
-      log('未找到 datas/dp.data 等数组字段。当前 keys:', Object.keys(curObj));
-      return String(currentRaw);
-    }
-
-    const curList = curMeta ? curMeta.list : [];
-    const arcList = arcMeta ? arcMeta.list : [];
-    const { list: merged, added } = mergeLists(curList, arcList);
-
-    // 写回：优先写当前结构
-    let writeRoot = curObj;
-    let writePath = curMeta && curMeta.path;
-
-    if (curMeta && curMeta.isRv) {
-      // 列表在 ReturnValue 字符串内部
-      writeRoot = curObj.__rvObj;
-      writePath = curMeta.path;
-      if (writePath) setByPath(writeRoot, writePath, merged);
-      const cPath = findCountPath(writeRoot);
-      if (cPath) setByPath(writeRoot, cPath, merged.length);
-      else writeRoot.dataCount = merged.length;
-      curObj.ReturnValue = JSON.stringify(writeRoot);
-      delete curObj.__rvObj;
-    } else if (curMeta && writePath) {
-      setByPath(curObj, writePath, merged);
-      const cPath = findCountPath(curObj);
-      if (cPath) setByPath(curObj, cPath, merged.length);
-      else if (!Array.isArray(curObj)) curObj.dataCount = merged.length;
-      delete curObj.__rvObj;
-    } else if (Array.isArray(curObj)) {
-      curObj = merged;
-    } else if (arcMeta && arcMeta.path) {
-      // 当前无数据、归档有
-      setByPath(curObj, arcMeta.path, merged);
-      curObj.dataCount = merged.length;
-      delete curObj.__rvObj;
-    } else {
-      curObj.datas = merged;
-      curObj.dataCount = merged.length;
-      delete curObj.__rvObj;
-    }
-
-    const jsonText = JSON.stringify(curObj);
-    log(
-      `合并完成：当前 ${curList.length} + 归档新增 ${added} = ${merged.length}`,
-      curWrap.prefix ? `(前缀 ${JSON.stringify(curWrap.prefix)})` : ''
-    );
-    return curWrap.prefix + jsonText;
+    return rv;
   }
 
-  // ---------- 请求 ----------
+  /** 按 o_id 去重合并，当前优先 */
+  function mergeDatas(curDatas, arcDatas) {
+    const seen = new Set();
+    const out = [];
+    let added = 0;
+
+    const push = (row, fromArc) => {
+      if (!row || typeof row !== 'object') return;
+      const id = row.o_id;
+      const key = id != null && id !== '' ? `o_id:${id}` : `json:${JSON.stringify(row)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push(row);
+      if (fromArc) added++;
+    };
+
+    (curDatas || []).forEach((r) => push(r, false));
+    (arcDatas || []).forEach((r) => push(r, true));
+    return { list: out, added };
+  }
+
+  /** 更新 dp.Increament.KeyValue 为列表中最小 o_id（增量分页） */
+  function patchDp(dp, datas) {
+    if (!dp || typeof dp !== 'object') return dp;
+    const next = { ...dp };
+    // 原接口 DataCount 常为 -1，保持不动，避免误导分页 UI
+    if (next.Increament && typeof next.Increament === 'object') {
+      const ids = (datas || [])
+        .map((r) => r && r.o_id)
+        .filter((v) => v != null && v !== '')
+        .map(Number)
+        .filter((n) => !Number.isNaN(n));
+      if (ids.length) {
+        next.Increament = {
+          ...next.Increament,
+          KeyName: next.Increament.KeyName || 'o_id',
+          KeyValue: String(Math.min(...ids)),
+        };
+      }
+    }
+    return next;
+  }
+
+  /**
+   * 合并两路完整响应文本 → 写回同结构字符串
+   */
+  function mergeResponses(currentRaw, archiveRaw) {
+    const cur = parseEnvelope(currentRaw);
+    const arc = parseEnvelope(archiveRaw);
+
+    if (!cur.envelope) {
+      log('当前响应解析失败，原样返回。预览:', String(currentRaw).slice(0, 160));
+      return String(currentRaw);
+    }
+
+    const curTable = getTablePayload(cur.envelope);
+    if (!curTable) {
+      log('当前无 ReturnValue.datas，原样返回。keys:', Object.keys(cur.envelope));
+      return String(currentRaw);
+    }
+
+    let arcDatas = [];
+    if (arc.envelope) {
+      const arcTable = getTablePayload(arc.envelope);
+      if (arcTable) arcDatas = arcTable.datas || [];
+      else log('归档无 datas，仅用当前');
+    } else {
+      log('归档响应解析失败，仅用当前');
+    }
+
+    const { list: merged, added } = mergeDatas(curTable.datas, arcDatas);
+
+    const newTable = {
+      ...curTable,
+      dp: patchDp(curTable.dp, merged),
+      datas: merged,
+    };
+
+    // 写回 envelope：ReturnValue 必须仍是「字符串」
+    const outEnvelope = {
+      ...cur.envelope,
+      ReturnValue: JSON.stringify(newTable),
+    };
+
+    const out = (cur.prefix || '') + JSON.stringify(outEnvelope);
+    log(
+      `合并完成：当前 ${curTable.datas.length} + 归档新增 ${added} = ${merged.length}`
+    );
+    return out;
+  }
+
+  // ==================== 请求 ====================
   function headersToObject(headers) {
     if (!headers) return {};
     const skip = (k) => {
@@ -347,12 +248,9 @@
     return o;
   }
 
-  /** 归档请求：body 原样，只改 URL + Referer */
   function buildArchiveHeaders(baseHeaders, requestUrl) {
     const h = { ...headersToObject(baseHeaders) };
-    // 抓包里归档 referer 带 archive/no_data
     h.Referer = toArchiveReferer(requestUrl);
-    // 保证表单 POST 头
     if (!h['Content-Type'] && !h['content-type']) {
       h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8';
     }
@@ -435,8 +333,8 @@
       configurable: true,
       get: () => {
         if ((xhr.responseType || '') === 'json') {
-          const w = unwrapPayload(text);
-          return w.obj != null ? w.obj : safeJson(text);
+          const { envelope } = parseEnvelope(text);
+          return envelope;
         }
         return text;
       },
@@ -476,7 +374,7 @@
     } catch (_) {}
   }
 
-  // ---------- hook XHR（抓包是 XHR） ----------
+  // ==================== Hook XHR ====================
   XHR.open = function (method, url) {
     this.__merge = {
       method: (method || 'GET').toUpperCase(),
@@ -515,7 +413,7 @@
     })();
   };
 
-  // ---------- hook fetch（兜底） ----------
+  // ==================== Hook fetch 兜底 ====================
   const rawFetch = window.fetch.bind(window);
   window.fetch = async function (input, init) {
     const url = typeof input === 'string' ? input : input && input.url;
@@ -560,5 +458,8 @@
     }
   };
 
-  log('已注入 v1.2.0 — 拦截当前列表并合并归档');
+  // 暴露合并函数，方便控制台自测
+  window.__jstOrderMerge = { mergeResponses, parseEnvelope, getTablePayload };
+
+  log('已注入 v1.3.0 — 按 o_id 合并 ReturnValue.datas');
 })();
